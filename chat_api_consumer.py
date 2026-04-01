@@ -2,30 +2,25 @@ import requests
 import json
 
 # Placeholder for AWS hostname - replace with your actual endpoint
-HOSTNAME = "https://your-aws-endpoint.amazonaws.com"
-
+ENDPOINT = "http://wiphackq0vcsii.cloudloka.com:8000/v1/completions"
+# sudo curl http://wiphackxlw49hx.cloudloka.com:8000/v1/chat/completions -H "Content-Type: application/json" -d '{"model": "Qwen/Qwen3-8B", "messages": [ {"role": "user", "content": "What is KV cache in transformers?"}], "max_tokens": 128, "temperature": 0.7}'
 # API endpoint for chat completions
-ENDPOINT = f"{HOSTNAME}/v1/chat/completions"
-
-# Placeholder for API key - replace with your actual key
-API_KEY = "YOUR_API_KEY"
+#ENDPOINT = f"{HOSTNAME}/v1/chat/completions"
 
 def consume_chat_api():
     """
     Consumes the chat/completions API and records the response.
     """
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
     }
 
     # Example payload for chat completion
     payload = {
-        "model": "your-model-name",  # Replace with actual model name
-        "messages": [
-            {"role": "user", "content": "Hello, how are you?"}
-        ],
-        "max_tokens": 100  # Adjust as needed
+        "model": "meta-llama/Meta-Llama-3.1-8B-Instruct",  # Replace with actual model name
+        "prompt": "What is Machine Learning?",
+        "max_tokens": 100,
+        "temperature": 0.5  # Adjust as needed
     }
 
     try:
