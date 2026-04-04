@@ -35,9 +35,22 @@ LLM_ENDPOINT = "http://wiphackq0vcsii.cloudloka.com:8000/v1/completions"
 LLM_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 MAX_TOKENS = 512
 TEMPERATURE = 0.3          # lower = more deterministic / consistent
-HISTORICAL_FILE = "alerts_data.xlsx"
-OPEN_ALERTS_FILE = "open_alerts_data.xlsx"
-OUTPUT_FILE = "auto_closure_report.xlsx"
+
+# Timeout tuple: (connect_timeout_seconds, read_timeout_seconds)
+# connect — how long to wait for the TCP handshake to complete
+# read    — how long to wait for the model to stream back the full response;
+#           large prompts with 500+ tokens can take 90-120 s on small GPUs
+LLM_TIMEOUT_CONNECT = 15    # seconds to establish connection
+LLM_TIMEOUT_READ    = 180   # seconds to receive the full completion
+LLM_RETRIES         = 2     # number of retry attempts on timeout / 5xx
+
+# All paths resolve relative to THIS script's directory.
+# server.py lives in the same folder and serves open_alerts_data.xlsx
+# automatically — Agent 3 writes here so the browser picks it up instantly.
+_HERE            = Path(__file__).parent.resolve()
+HISTORICAL_FILE  = str(_HERE / "alerts_data.xlsx")
+OPEN_ALERTS_FILE = str(_HERE / "open_alerts_data.xlsx")
+OUTPUT_FILE      = str(_HERE / "auto_closure_report.xlsx")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -137,15 +150,50 @@ class BaseAgent:
             "max_tokens": max_tokens,
             "temperature": TEMPERATURE,
         }
-        try:
-            resp = requests.post(LLM_ENDPOINT, json=payload, timeout=60)
-            resp.raise_for_status()
-            data = resp.json()
-            # OpenAI-compatible /v1/completions response
-            return data["choices"][0]["text"].strip()
-        except Exception as exc:
-            log.error("LLM call failed: %s", exc)
-            raise
+        # Split timeout: (connect, read)
+        # A large prompt can take a long time to generate — read timeout is
+        # intentionally generous so we don't abort mid-generation.
+        timeout = (LLM_TIMEOUT_CONNECT, LLM_TIMEOUT_READ)
+        last_exc = None
+        for attempt in range(1, LLM_RETRIES + 2):  # 1 original + LLM_RETRIES
+            try:
+                log.debug("LLM call attempt %d/%d (connect=%ss read=%ss)",
+                          attempt, LLM_RETRIES + 1,
+                          LLM_TIMEOUT_CONNECT, LLM_TIMEOUT_READ)
+                resp = requests.post(LLM_ENDPOINT, json=payload, timeout=timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                # OpenAI-compatible /v1/completions response
+                return data["choices"][0]["text"].strip()
+            except requests.exceptions.ConnectTimeout as exc:
+                last_exc = exc
+                log.warning("LLM attempt %d: connect timeout after %ss — %s",
+                            attempt, LLM_TIMEOUT_CONNECT, exc)
+            except requests.exceptions.ReadTimeout as exc:
+                last_exc = exc
+                log.warning("LLM attempt %d: read timeout after %ss — "
+                            "model is still generating; consider raising "
+                            "LLM_TIMEOUT_READ or reducing prompt size", attempt,
+                            LLM_TIMEOUT_READ)
+            except requests.exceptions.HTTPError as exc:
+                last_exc = exc
+                # Only retry on 5xx server errors, not 4xx client errors
+                if exc.response is not None and exc.response.status_code < 500:
+                    log.error("LLM call failed (client error, no retry): %s", exc)
+                    raise
+                log.warning("LLM attempt %d: server error %s", attempt, exc)
+            except Exception as exc:
+                last_exc = exc
+                log.error("LLM call failed (non-retryable): %s", exc)
+                raise
+
+            if attempt <= LLM_RETRIES:
+                wait = attempt * 3  # 3 s, 6 s, …
+                log.info("Retrying in %ss…", wait)
+                import time; time.sleep(wait)
+
+        log.error("LLM call failed after %d attempts: %s", LLM_RETRIES + 1, last_exc)
+        raise last_exc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
