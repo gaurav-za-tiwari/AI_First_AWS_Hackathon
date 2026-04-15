@@ -1,10 +1,12 @@
 """
 AML Alert Auto-Closure System — Google A2A Agent Architecture
 =============================================================
-Agent 1 (TrainingAgent)  : Reads alerts_data.xlsx and builds a knowledge base
-                           by sending historical alerts to the LLM for pattern learning.
-Agent 2 (AnalysisAgent)  : Reads open_alerts_data.xlsx and analyses each open alert
-                           using the trained knowledge base.
+Agent 1 (EmbeddingAgent) : Reads alerts_data.xlsx, embeds each alert row into
+                           a vector and upserts into ChromaDB (persisted on disk).
+                           Skips rows already embedded on re-runs — incremental only.
+Agent 2 (AnalysisAgent)  : For each open alert, embeds it then queries ChromaDB for
+                           the top-K most similar historical alerts. Only that small
+                           context window is sent to the LLM — no full-file dumps.
 Agent 3 (ReportAgent)    : Produces an auto-closure report and writes decisions +
                            comments back into open_alerts_data.xlsx.
 Agent 4 (ArchiveAgent)   : Archives alerts_data.xlsx into KB_Processed/ (merging
@@ -26,6 +28,18 @@ import pandas as pd
 import requests
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
+
+# RAG dependencies — install with:
+#   pip install chromadb sentence-transformers
+# chromadb  : local vector database, persisted to disk
+# sentence-transformers : local embedding model (no API key needed)
+try:
+    import chromadb
+    from chromadb.config import Settings
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    log_rag_missing = True
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -56,6 +70,14 @@ HISTORICAL_FILE  = str(_HERE / "alerts_data.xlsx")
 OPEN_ALERTS_FILE = str(_HERE / "open_alerts_data.xlsx")
 OUTPUT_FILE      = str(_HERE / "auto_closure_report.xlsx")
 KB_PROCESSED_DIR = _HERE / "KB_Processed"   # archive folder — created on first run
+
+# ── RAG / Vector DB config ─────────────────────────────────────────────────────
+VECTOR_DB_DIR    = str(_HERE / "vector_db")   # ChromaDB persists here
+COLLECTION_NAME  = "aml_alerts"               # one collection, all sheets
+EMBED_ENDPOINT   = LLM_ENDPOINT.replace("/v1/completions", "/v1/embeddings")
+EMBED_MODEL      = LLM_MODEL                  # same model used for embeddings
+RAG_TOP_K        = 5    # number of similar historical alerts retrieved per query
+RAG_FALLBACK_KB  = True # if ChromaDB unavailable, fall back to in-memory KB rules
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -120,7 +142,7 @@ class A2AOrchestrator:
     async def run_pipeline(self):
         """Execute the four-agent pipeline sequentially."""
         tid1 = str(uuid.uuid4())
-        await self.send(Message("orchestrator", "TrainingAgent", tid1,
+        await self.send(Message("orchestrator", "EmbeddingAgent", tid1,
                                 {"file": HISTORICAL_FILE}))
 
         tid2 = str(uuid.uuid4())
@@ -153,6 +175,24 @@ class BaseAgent:
     async def handle(self, task: Task) -> dict:
         raise NotImplementedError
 
+    # ── Embedding helper ───────────────────────────────────────────────────────
+    def embed_text(self, text: str) -> list[float]:
+        """
+        Calls the /v1/embeddings endpoint to get a vector for `text`.
+        Returns a list of floats (the embedding).
+        Falls back to a zero vector on failure so the pipeline never crashes.
+        """
+        payload = {"model": EMBED_MODEL, "input": text}
+        timeout = (LLM_TIMEOUT_CONNECT, LLM_TIMEOUT_READ)
+        try:
+            resp = requests.post(EMBED_ENDPOINT, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["data"][0]["embedding"]
+        except Exception as exc:
+            log.warning("embed_text failed (%s) — returning zero vector", exc)
+            return []   # ChromaDB will reject empty; caller must handle
+
     # ── LLM helper ─────────────────────────────────────────────────────────────
     def call_llm(self, prompt: str, max_tokens: int = MAX_TOKENS) -> str:
         payload = {
@@ -175,7 +215,22 @@ class BaseAgent:
                 resp.raise_for_status()
                 data = resp.json()
                 # OpenAI-compatible /v1/completions response
-                return data["choices"][0]["text"].strip()
+                raw_text = data["choices"][0]["text"].strip()
+                # Strip markdown code fences the model sometimes wraps around JSON
+                if raw_text.startswith("```"):
+                    raw_text = raw_text.split("```")[1]
+                    if raw_text.lower().startswith("json"):
+                        raw_text = raw_text[4:]
+                    raw_text = raw_text.strip()
+                if not raw_text:
+                    log.warning("LLM returned empty response (attempt %d) — "
+                                "finish_reason=%s, usage=%s",
+                                attempt,
+                                data["choices"][0].get("finish_reason", "?"),
+                                data.get("usage", {}))
+                    raise ValueError("Empty LLM response")
+                log.debug("LLM raw response (first 200 chars): %s", raw_text[:200])
+                return raw_text
             except requests.exceptions.ConnectTimeout as exc:
                 last_exc = exc
                 log.warning("LLM attempt %d: connect timeout after %ss — %s",
@@ -208,118 +263,196 @@ class BaseAgent:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AGENT 1 — TRAINING AGENT
+# AGENT 1 — EMBEDDING AGENT  (replaces TrainingAgent)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TrainingAgent(BaseAgent):
+class EmbeddingAgent(BaseAgent):
     """
-    Reads alerts_data.xlsx (all sheets), extracts closed / resolved alerts
-    and asks the LLM to summarise patterns and closure criteria.
-    Stores the resulting knowledge base in the orchestrator's shared store.
+    RAG Step 1 — Build the vector knowledge base.
+
+    Reads alerts_data.xlsx, converts every row into a dense text representation,
+    calls the LLM embedding endpoint to get a vector, and upserts the result into
+    a ChromaDB collection persisted on disk.
+
+    Incremental by design: alert IDs already present in the collection are skipped,
+    so re-running the pipeline on the same file is cheap (no re-embedding).
+
+    Also stores lightweight in-memory fallback rules (used by AnalysisAgent if
+    ChromaDB is unavailable or the embedding call fails).
     """
-    name = "TrainingAgent"
+    name = "EmbeddingAgent"
+
+    @staticmethod
+    def _row_to_text(row: dict) -> str:
+        """Serialise one alert row into a compact, embedding-friendly string."""
+        return (
+            f"AlertType={row.get('alert_type','')} "
+            f"Score={row.get('score','')} "
+            f"Status={row.get('status','')} "
+            f"Priority={row.get('priority','')} "
+            f"Country={row.get('country','')} "
+            f"Currency={row.get('currency','')} "
+            f"Amount={row.get('amount','')} "
+            f"Description={str(row.get('description',''))[:120]}"
+        )
+
+    @staticmethod
+    def _row_to_metadata(row: dict) -> dict:
+        """Flatten one alert row into ChromaDB-compatible metadata (str/int/float only)."""
+        return {
+            "sheet":       str(row.get("sheet", "")),
+            "alert_id":    str(row.get("alert_id", "")),
+            "alert_type":  str(row.get("alert_type", "")),
+            "score":       float(row.get("score", 0)),
+            "status":      str(row.get("status", "")),
+            "priority":    str(row.get("priority", "")),
+            "description": str(row.get("description", ""))[:200],
+            "country":     str(row.get("country", "")),
+            "currency":    str(row.get("currency", "")),
+            "amount":      float(row.get("amount", 0)),
+        }
+
+    def _get_collection(self):
+        """Return (or create) the persisted ChromaDB collection."""
+        client = chromadb.PersistentClient(
+            path=VECTOR_DB_DIR,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        return client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     async def handle(self, task: Task) -> dict:
         file_path = task.input["file"]
-        log.info("[TrainingAgent] Loading historical data from %s", file_path)
 
+        if not RAG_AVAILABLE:
+            log.warning("[EmbeddingAgent] chromadb not installed — "
+                        "falling back to rule-based KB. Run: pip install chromadb")
+            return self._build_fallback_kb(file_path)
+
+        log.info("[EmbeddingAgent] Loading historical data from %s", file_path)
         all_sheets = pd.read_excel(file_path, sheet_name=None)
-        patterns: list[dict] = []
+
+        collection   = self._get_collection()
+        existing_ids = set(collection.get(include=[])["ids"])
+        log.info("[EmbeddingAgent] Collection '%s' has %d existing vectors",
+                 COLLECTION_NAME, len(existing_ids))
+
+        embedded = skipped = failed = 0
 
         for sheet_name, df in all_sheets.items():
             df.columns = [c.strip() for c in df.columns]
-            # We learn from ALL alerts (open ones teach what NOT to auto-close)
+            for _, row in df.iterrows():
+                alert_id = str(row.get("Alert ID", "")).strip()
+                if not alert_id:
+                    continue
+
+                # Incremental: skip rows already in the vector store
+                if alert_id in existing_ids:
+                    skipped += 1
+                    continue
+
+                row_dict = {
+                    "sheet":       sheet_name,
+                    "alert_id":    alert_id,
+                    "alert_type":  str(row.get("Alert Type", "")),
+                    "alert_type_id": str(row.get("Alert Type ID", "")),
+                    "score":       float(row.get("Score", 0) or 0),
+                    "status":      str(row.get("Status", "")),
+                    "priority":    str(row.get("Priority", "")),
+                    "description": str(row.get("Description", "")),
+                    "amount":      float(row.get("Amount", 0) or 0),
+                    "currency":    str(row.get("Currency", "")),
+                    "country":     str(row.get("Country", "")),
+                }
+
+                text      = self._row_to_text(row_dict)
+                embedding = self.embed_text(text)
+
+                if not embedding:
+                    log.warning("[EmbeddingAgent] Skipping %s — empty embedding", alert_id)
+                    failed += 1
+                    continue
+
+                collection.upsert(
+                    ids=[alert_id],
+                    embeddings=[embedding],
+                    documents=[text],
+                    metadatas=[self._row_to_metadata(row_dict)],
+                )
+                embedded += 1
+
+        total = collection.count()
+        log.info("[EmbeddingAgent] Done — embedded=%d skipped=%d failed=%d "
+                 "| collection total=%d", embedded, skipped, failed, total)
+
+        # Store collection reference and fallback rules in shared KB
+        self.orchestrator.knowledge_base["chroma_collection"] = collection
+        self.orchestrator.knowledge_base["rag_available"]     = True
+        self._seed_fallback_rules()
+
+        return {
+            "status":     "embedded",
+            "embedded":   embedded,
+            "skipped":    skipped,
+            "failed":     failed,
+            "total_vectors": total,
+        }
+
+    def _seed_fallback_rules(self):
+        """Always store lightweight rules as a safety net."""
+        self.orchestrator.knowledge_base.setdefault("closure_criteria", [
+            "Score < 75 with Low priority → auto-close",
+            "Score < 80 with Medium priority and no high-risk country → auto-close",
+            "No cross-border component and score < 70 → auto-close",
+        ])
+        self.orchestrator.knowledge_base.setdefault("high_risk_indicators", [
+            "PEP network", "shell company", "high-risk jurisdiction",
+            "phantom shipment", "circular transactions",
+        ])
+        self.orchestrator.knowledge_base.setdefault("auto_close_score_threshold", 75)
+        self.orchestrator.knowledge_base.setdefault("never_auto_close_priorities",
+                                                    ["Critical", "Escalated"])
+
+    def _build_fallback_kb(self, file_path: str) -> dict:
+        """
+        Used when chromadb is not installed.
+        Reads the file and populates in-memory rules exactly as the old TrainingAgent did,
+        so the rest of the pipeline degrades gracefully.
+        """
+        all_sheets = pd.read_excel(file_path, sheet_name=None)
+        patterns: list[dict] = []
+        for sheet_name, df in all_sheets.items():
+            df.columns = [c.strip() for c in df.columns]
             for _, row in df.iterrows():
                 patterns.append({
-                    "sheet": sheet_name,
-                    "alert_id": str(row.get("Alert ID", "")),
-                    "alert_type": str(row.get("Alert Type", "")),
-                    "alert_type_id": str(row.get("Alert Type ID", "")),
-                    "score": row.get("Score", 0),
-                    "status": str(row.get("Status", "")),
-                    "priority": str(row.get("Priority", "")),
+                    "sheet":       sheet_name,
+                    "alert_id":    str(row.get("Alert ID", "")),
+                    "alert_type":  str(row.get("Alert Type", "")),
+                    "score":       float(row.get("Score", 0) or 0),
+                    "status":      str(row.get("Status", "")),
+                    "priority":    str(row.get("Priority", "")),
                     "description": str(row.get("Description", "")),
-                    "amount": row.get("Amount", 0),
-                    "currency": str(row.get("Currency", "")),
-                    "country": str(row.get("Country", "")),
+                    "amount":      float(row.get("Amount", 0) or 0),
+                    "currency":    str(row.get("Currency", "")),
+                    "country":     str(row.get("Country", "")),
                 })
-
-        closed = [p for p in patterns if p["status"].lower() == "closed"]
-        open_  = [p for p in patterns if p["status"].lower() == "open"]
-        escalated = [p for p in patterns if p["status"].lower() == "escalated"]
-
-        log.info("[TrainingAgent] %d total | %d closed | %d open | %d escalated",
-                 len(patterns), len(closed), len(open_), len(escalated))
-
-        # Build a compact training summary to send to the LLM
-        training_text = self._build_training_text(closed, open_, escalated)
-        prompt = (
-            "You are an expert AML (Anti-Money Laundering) compliance analyst.\n"
-            "Below are historical AML alerts with their statuses.\n"
-            "Analyse the patterns and extract CLEAR, NUMBERED closure criteria "
-            "that can be applied to future open alerts.\n"
-            "Focus on: risk score thresholds, priority levels, alert types, "
-            "transaction amounts, and country risk.\n\n"
-            f"{training_text}\n\n"
-            "Provide a structured JSON response with keys:\n"
-            "  'closure_criteria': list of rule strings\n"
-            "  'high_risk_indicators': list of red-flag strings\n"
-            "  'auto_close_score_threshold': integer (max score to auto-close)\n"
-            "  'never_auto_close_priorities': list of priority strings\n"
-            "Return ONLY valid JSON, no markdown fences."
-        )
-
-        log.info("[TrainingAgent] Sending training prompt to LLM …")
-        raw = self.call_llm(prompt, max_tokens=600)
-
-        try:
-            kb = json.loads(raw)
-        except json.JSONDecodeError:
-            log.warning("[TrainingAgent] LLM returned non-JSON; using defaults")
-            kb = self._default_knowledge_base()
-
-        kb["all_historical_patterns"] = patterns
-        self.orchestrator.knowledge_base.update(kb)
-        log.info("[TrainingAgent] Knowledge base stored. Criteria: %s",
-                 kb.get("closure_criteria", []))
-        return {"status": "trained", "patterns_count": len(patterns),
-                "knowledge_base_keys": list(kb.keys())}
-
-    def _build_training_text(self, closed, open_, escalated) -> str:
-        lines = ["=== CLOSED ALERTS (model for auto-closure) ==="]
-        for a in closed:
-            lines.append(
-                f"  [{a['alert_id']}] Type={a['alert_type']} Score={a['score']} "
-                f"Priority={a['priority']} Desc={a['description'][:80]}"
-            )
-        lines.append("\n=== OPEN / IN-REVIEW ALERTS (not yet resolved) ===")
-        for a in open_[:5]:   # sample
-            lines.append(
-                f"  [{a['alert_id']}] Type={a['alert_type']} Score={a['score']} "
-                f"Priority={a['priority']} Desc={a['description'][:80]}"
-            )
-        lines.append("\n=== ESCALATED ALERTS (high-risk, do NOT auto-close) ===")
-        for a in escalated:
-            lines.append(
-                f"  [{a['alert_id']}] Type={a['alert_type']} Score={a['score']} "
-                f"Priority={a['priority']} Desc={a['description'][:80]}"
-            )
-        return "\n".join(lines)
-
-    def _default_knowledge_base(self) -> dict:
-        return {
+        kb = {
             "closure_criteria": [
                 "Score < 75 with Low priority → auto-close",
-                "Score < 80 with Medium priority and no PEP/high-risk country → auto-close",
-                "No cross-border component and score < 70 → auto-close",
+                "Score < 80 with Medium priority and no high-risk country → auto-close",
             ],
-            "high_risk_indicators": [
-                "PEP network", "shell company", "high-risk jurisdiction",
-                "phantom shipment", "circular transactions",
-            ],
+            "high_risk_indicators": ["PEP network", "shell company",
+                                     "high-risk jurisdiction", "phantom shipment"],
             "auto_close_score_threshold": 75,
             "never_auto_close_priorities": ["Critical", "Escalated"],
+            "all_historical_patterns": patterns,
+            "rag_available": False,
         }
+        self.orchestrator.knowledge_base.update(kb)
+        log.info("[EmbeddingAgent] Fallback KB built with %d patterns.", len(patterns))
+        return {"status": "fallback_kb", "patterns_count": len(patterns)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -388,42 +521,210 @@ class AnalysisAgent(BaseAgent):
         log.info("[AnalysisAgent] Analysis complete. %d decisions made.", len(decisions))
         return {"status": "analysed", "decisions_count": len(decisions)}
 
+    # Compact prompt sent per-alert — kept short to avoid truncation
+    _ALERT_PROMPT = (
+        "You are an AML compliance officer. Analyse this alert and respond with "
+        "ONLY a JSON object — no explanation, no markdown, no extra text.\n\n"
+        "Rules:\n"
+        "  Score threshold for auto-closure: {threshold}\n"
+        "  Never auto-close priorities: {never_close}\n"
+        "  High-risk indicators (escalate if present): {high_risk}\n\n"
+        "Alert:\n"
+        "  ID={alert_id} Type={alert_type} Score={score} "
+        "Priority={priority} Country={country}\n"
+        "  Amount={amount} {currency}\n"
+        "  Description: {description}\n\n"
+        "Required JSON keys (respond with NOTHING else):\n"
+        '  {{"action":"AUTO_CLOSE|ESCALATE|REVIEW",'
+        '"confidence":"HIGH|MEDIUM|LOW",'
+        '"comment":"<2 sentence professional closure comment>",'
+        '"risk_flags":["flag1","flag2"]}}'
+    )
+
+    def _retrieve_similar(self, alert: dict) -> str:
+        """
+        RAG retrieval step.
+        Embeds the open alert and queries ChromaDB for RAG_TOP_K most similar
+        historical alerts. Returns a formatted context string for the LLM prompt.
+        Returns empty string if RAG is unavailable.
+        """
+        kb         = self.orchestrator.knowledge_base
+        collection = kb.get("chroma_collection")
+        if collection is None:
+            return ""
+
+        query_text = (
+            f"AlertType={alert.get('alert_type','')} "
+            f"Score={alert.get('score','')} "
+            f"Status=Open "
+            f"Priority={alert.get('priority','')} "
+            f"Country={alert.get('country','')} "
+            f"Currency={alert.get('currency','')} "
+            f"Amount={alert.get('amount','')} "
+            f"Description={str(alert.get('description',''))[:120]}"
+        )
+
+        embedding = self.embed_text(query_text)
+        if not embedding:
+            log.warning("[AnalysisAgent] Could not embed alert %s — skipping RAG",
+                        alert["alert_id"])
+            return ""
+
+        try:
+            results = collection.query(
+                query_embeddings=[embedding],
+                n_results=min(RAG_TOP_K, collection.count()),
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception as exc:
+            log.warning("[AnalysisAgent] ChromaDB query failed for %s: %s",
+                        alert["alert_id"], exc)
+            return ""
+
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        if not metadatas:
+            return ""
+
+        lines = [f"Top-{len(metadatas)} similar historical alerts (cosine distance):"]
+        for i, (meta, dist) in enumerate(zip(metadatas, distances), 1):
+            similarity = round((1 - dist) * 100, 1)
+            lines.append(
+                f"  {i}. [{meta.get('alert_id','')}] "
+                f"Type={meta.get('alert_type','')} "
+                f"Score={meta.get('score','')} "
+                f"Status={meta.get('status','')} "
+                f"Priority={meta.get('priority','')} "
+                f"Country={meta.get('country','')} "
+                f"Desc={meta.get('description','')[:80]} "
+                f"(similarity={similarity}%)"
+            )
+
+        log.debug("[AnalysisAgent] RAG retrieved %d examples for %s",
+                  len(metadatas), alert["alert_id"])
+        return "\n".join(lines)
+
+    # RAG-enhanced prompt — similar examples replace the full KB dump
+    _RAG_PROMPT = (
+        "You are an AML compliance officer. Use the similar historical cases below "
+        "to decide how to handle the new alert. Respond with ONLY a JSON object — "
+        "no explanation, no markdown, no extra text.\n\n"
+        "Historical similar cases (learn the pattern from Status field):\n"
+        "{similar_cases}\n\n"
+        "Rules:\n"
+        "  Score threshold for auto-closure: {threshold}\n"
+        "  Never auto-close priorities: {never_close}\n"
+        "  High-risk indicators (escalate if present): {high_risk}\n\n"
+        "New alert to decide:\n"
+        "  ID={alert_id} Type={alert_type} Score={score} "
+        "Priority={priority} Country={country}\n"
+        "  Amount={amount} {currency}\n"
+        "  Description: {description}\n\n"
+        'Required JSON: {{"action":"AUTO_CLOSE|ESCALATE|REVIEW",'
+        '"confidence":"HIGH|MEDIUM|LOW",'
+        '"comment":"<2 sentence professional comment>",'
+        '"risk_flags":["flag1"]}}'
+    )
+
     def _analyse_alert(self, alert: dict, criteria_text: str,
                        high_risk_text: str, threshold: int,
                        never_close: list) -> dict:
-        prompt = (
-            "You are a senior AML compliance officer making auto-closure decisions.\n\n"
-            f"KNOWLEDGE BASE — Closure Criteria:\n{criteria_text}\n\n"
-            f"High-Risk Indicators (never auto-close if present): {high_risk_text}\n"
-            f"Score threshold for auto-closure: {threshold}\n"
-            f"Priorities that must NEVER be auto-closed: {', '.join(never_close)}\n\n"
-            "ALERT TO ANALYSE:\n"
-            f"  Alert ID   : {alert['alert_id']}\n"
-            f"  Customer   : {alert['customer_name']} ({alert['customer_id']})\n"
-            f"  Type       : {alert['alert_type']}\n"
-            f"  Score      : {alert['score']}\n"
-            f"  Priority   : {alert['priority']}\n"
-            f"  Amount     : {alert['amount']} {alert['currency']}\n"
-            f"  Country    : {alert['country']}\n"
-            f"  Description: {alert['description']}\n\n"
-            "Respond ONLY with a JSON object containing:\n"
-            "  'action'     : 'AUTO_CLOSE' or 'ESCALATE' or 'REVIEW'\n"
-            "  'confidence' : 'HIGH' or 'MEDIUM' or 'LOW'\n"
-            "  'comment'    : closure/escalation comment (2-3 sentences, professional tone)\n"
-            "  'risk_flags' : list of risk flag strings found (empty list if none)\n"
-            "Return ONLY valid JSON, no markdown fences."
-        )
+        # ── RAG retrieval ─────────────────────────────────────────────────────
+        similar_cases = self._retrieve_similar(alert)
+        rag_used      = bool(similar_cases)
 
+        if rag_used:
+            prompt = self._RAG_PROMPT.format(
+                similar_cases = similar_cases,
+                threshold     = threshold,
+                never_close   = ", ".join(never_close),
+                high_risk     = high_risk_text[:200],
+                alert_id      = alert["alert_id"],
+                alert_type    = alert["alert_type"],
+                score         = alert["score"],
+                priority      = alert["priority"],
+                country       = alert["country"],
+                amount        = alert["amount"],
+                currency      = alert["currency"],
+                description   = alert["description"][:120],
+            )
+        else:
+            # Fallback: compact rule-based prompt (no similar cases available)
+            prompt = self._ALERT_PROMPT.format(
+                threshold    = threshold,
+                never_close  = ", ".join(never_close),
+                high_risk    = high_risk_text[:200],
+                alert_id     = alert["alert_id"],
+                alert_type   = alert["alert_type"],
+                score        = alert["score"],
+                priority     = alert["priority"],
+                country      = alert["country"],
+                amount       = alert["amount"],
+                currency     = alert["currency"],
+                description  = alert["description"][:120],
+            )
+
+        result = None
         try:
-            raw = self.call_llm(prompt, max_tokens=300)
-            result = json.loads(raw)
-        except (json.JSONDecodeError, Exception) as exc:
+            raw    = self.call_llm(prompt, max_tokens=200)
+            result = self._extract_json(raw, alert["alert_id"])
+        except Exception as exc:
             log.warning("[AnalysisAgent] LLM parse error for %s: %s — using rule-based fallback",
                         alert["alert_id"], exc)
+
+        if result is None:
             result = self._rule_based_decision(alert, threshold, never_close, high_risk_text)
+
+        # Normalise: guarantee all required keys exist
+        result.setdefault("action",     "REVIEW")
+        result.setdefault("confidence", "LOW")
+        result.setdefault("comment",    "Decision made via fallback rule engine.")
+        result.setdefault("risk_flags", [])
+        result["action"]   = str(result["action"]).upper()
+        result["rag_used"] = rag_used          # trace flag for the report
 
         result["alert"] = alert
         return result
+
+    @staticmethod
+    def _extract_json(raw: str, alert_id: str) -> dict:
+        """
+        Robustly extract a JSON object from the LLM response.
+        Handles: leading/trailing text, markdown fences, single-quoted keys,
+        partial responses that still contain a valid { ... } block.
+        """
+        if not raw:
+            raise ValueError("Empty response from LLM")
+
+        # 1. Try parsing the whole string first (ideal case)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+
+        # 2. Find the first '{' and last '}' and try just that substring
+        start = raw.find("{")
+        end   = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = raw[start:end + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+            # 3. Replace Python/JS-style single quotes with double quotes
+            #    and try once more (some models output {'key':'val'})
+            import re
+            fixed = re.sub(r"(?<![\\])'", '"', candidate)
+            try:
+                return json.loads(fixed)
+            except json.JSONDecodeError:
+                pass
+
+        log.warning("[AnalysisAgent] Could not extract JSON for %s. Raw (200 chars): %s",
+                    alert_id, raw[:200])
+        return None
 
     def _rule_based_decision(self, alert: dict, threshold: int,
                               never_close: list, high_risk_text: str) -> dict:
@@ -859,14 +1160,15 @@ async def main():
     print("═" * 70 + "\n")
 
     orchestrator = A2AOrchestrator()
-    orchestrator.register(TrainingAgent())
+    orchestrator.register(EmbeddingAgent())
     orchestrator.register(AnalysisAgent())
     orchestrator.register(ReportAgent())
     orchestrator.register(ArchiveAgent())
 
     result = await orchestrator.run_pipeline()
+    rag_on = orchestrator.knowledge_base.get("rag_available", False)
     print("\n" + "═" * 70)
-    print("  Pipeline Complete!")
+    print(f"  Pipeline Complete!  [RAG={'ON' if rag_on else 'OFF (fallback)'}]")
     print(f"  ✓ Auto-Closed  : {result.output.get('auto_closed', 0)}")
     print(f"  ✗ Escalated    : {result.output.get('escalated', 0)}")
     print(f"  ? Needs Review : {result.output.get('review', 0)}")
