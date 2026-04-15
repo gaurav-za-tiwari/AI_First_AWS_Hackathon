@@ -31,15 +31,24 @@ from openpyxl.styles import Font, PatternFill, Alignment
 
 # RAG dependencies — install with:
 #   pip install chromadb sentence-transformers
-# chromadb  : local vector database, persisted to disk
-# sentence-transformers : local embedding model (no API key needed)
+#
+# chromadb              : local vector database, persisted to disk — no server needed.
+# sentence-transformers : runs embedding models entirely inside this Python process.
+#                         No daemon, no extra server, no API key.
+#                         Models are cached in ~/.cache/huggingface after first download.
+#
+# Embedding model: all-MiniLM-L6-v2
+#   - 22 MB on disk, 384-dimensional vectors
+#   - Runs on CPU in ~50 ms per alert
+#   - Downloaded once from Hugging Face on first use, then works fully offline
 try:
     import chromadb
     from chromadb.config import Settings
+    from sentence_transformers import SentenceTransformer
     RAG_AVAILABLE = True
-except ImportError:
+except ImportError as _rag_err:
     RAG_AVAILABLE = False
-    log_rag_missing = True
+    _rag_import_err = str(_rag_err)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -74,10 +83,20 @@ KB_PROCESSED_DIR = _HERE / "KB_Processed"   # archive folder — created on firs
 # ── RAG / Vector DB config ─────────────────────────────────────────────────────
 VECTOR_DB_DIR    = str(_HERE / "vector_db")   # ChromaDB persists here
 COLLECTION_NAME  = "aml_alerts"               # one collection, all sheets
-EMBED_ENDPOINT   = LLM_ENDPOINT.replace("/v1/completions", "/v1/embeddings")
-EMBED_MODEL      = LLM_MODEL                  # same model used for embeddings
-RAG_TOP_K        = 5    # number of similar historical alerts retrieved per query
-RAG_FALLBACK_KB  = True # if ChromaDB unavailable, fall back to in-memory KB rules
+
+# sentence-transformers embedding model.
+# Model comparison (all run locally after first download):
+#   all-MiniLM-L6-v2        → 384-dim, ~22 MB,   ~50 ms/alert  ← default
+#   all-mpnet-base-v2        → 768-dim, ~420 MB,  ~120 ms/alert (higher accuracy)
+#   paraphrase-MiniLM-L3-v2 → 384-dim, ~17 MB,   ~25 ms/alert  (fastest)
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+
+# Module-level singleton so the model is loaded exactly once per process,
+# not once per alert call.
+_EMBED_MODEL: "SentenceTransformer | None" = None
+
+RAG_TOP_K       = 5    # similar historical alerts retrieved per open alert
+RAG_FALLBACK_KB = True # fall back to rule-based decisions if RAG unavailable
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -178,20 +197,34 @@ class BaseAgent:
     # ── Embedding helper ───────────────────────────────────────────────────────
     def embed_text(self, text: str) -> list[float]:
         """
-        Calls the /v1/embeddings endpoint to get a vector for `text`.
-        Returns a list of floats (the embedding).
-        Falls back to a zero vector on failure so the pipeline never crashes.
+        Embeds `text` using a local sentence-transformers model.
+
+        The model runs entirely inside this Python process on CPU — no daemon,
+        no HTTP call, no external server.  The SentenceTransformer singleton is
+        loaded once on the first call and reused for every subsequent call,
+        so the ~1 s model-load cost is paid only once per pipeline run.
+
+        On the very first run the model weights (~22 MB) are downloaded from
+        Hugging Face and cached in ~/.cache/huggingface/.  All subsequent runs
+        are fully offline.
+
+        Returns a plain Python list[float] compatible with ChromaDB.
+        Returns [] on any failure so the caller can skip that alert gracefully.
         """
-        payload = {"model": EMBED_MODEL, "input": text}
-        timeout = (LLM_TIMEOUT_CONNECT, LLM_TIMEOUT_READ)
+        global _EMBED_MODEL
+        if not RAG_AVAILABLE:
+            return []
         try:
-            resp = requests.post(EMBED_ENDPOINT, json=payload, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["data"][0]["embedding"]
+            if _EMBED_MODEL is None:
+                log.info("[embed] Loading '%s' (first call — "
+                         "downloads ~22 MB if not cached)…", EMBED_MODEL_NAME)
+                _EMBED_MODEL = SentenceTransformer(EMBED_MODEL_NAME)
+                log.info("[embed] Model ready.")
+            vector = _EMBED_MODEL.encode(text, show_progress_bar=False)
+            return vector.tolist()
         except Exception as exc:
-            log.warning("embed_text failed (%s) — returning zero vector", exc)
-            return []   # ChromaDB will reject empty; caller must handle
+            log.warning("embed_text failed (%s) — skipping this alert", exc)
+            return []
 
     # ── LLM helper ─────────────────────────────────────────────────────────────
     def call_llm(self, prompt: str, max_tokens: int = MAX_TOKENS) -> str:
@@ -327,8 +360,9 @@ class EmbeddingAgent(BaseAgent):
         file_path = task.input["file"]
 
         if not RAG_AVAILABLE:
-            log.warning("[EmbeddingAgent] chromadb not installed — "
-                        "falling back to rule-based KB. Run: pip install chromadb")
+            log.warning("[EmbeddingAgent] RAG packages not available — "
+                        "falling back to rule-based KB. "
+                        "Run: pip install chromadb sentence-transformers")
             return self._build_fallback_kb(file_path)
 
         log.info("[EmbeddingAgent] Loading historical data from %s", file_path)
