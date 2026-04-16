@@ -3,19 +3,21 @@ agent_archive.py
 ================
 Agent 4 — ArchiveAgent
 
-Runs after ReportAgent. Two responsibilities:
+Runs after ReportAgent. Two archival responsibilities:
 
-1. ARCHIVE — copy alerts_data.xlsx into KB_Processed/ with a UTC timestamp
-             in the filename, then merge it into a single cumulative master
-             file (KB_Processed/master_kb.xlsx).  Every run appends new rows;
-             the master file is created on the first run automatically.
-             A _run_timestamp column is added to every row so you can trace
-             which pipeline run produced each record.
+1. ARCHIVE HISTORICAL — move "Historical Alerts/alerts_data.xlsx" into
+   "KB_Processed/" with a UTC timestamp prefix, then merge it into the
+   cumulative master file (KB_Processed/master_kb.xlsx).
+   After the move, "Historical Alerts/" is empty and ready for the next
+   batch of historical data.
 
-2. PROMOTE — delete "Historical Alerts/alerts_data.xlsx" and move
-             "Closure Report/auto_closure_report.xlsx" into its place so the
-             next pipeline run trains Agent 1 on freshly decided data,
-             creating a self-improving loop.
+2. ARCHIVE OPEN ALERTS — move "Open Alerts/open_alerts_data.xlsx" into
+   "Processed_Alert/" with the same UTC timestamp prefix.
+   The file is only moved after the closure report has been successfully
+   written, so it is never lost if the pipeline fails mid-run.
+
+Note: The dated closure report in "Closure Report/" is the final output
+      of each run and is never moved or deleted by this agent.
 """
 
 import logging
@@ -40,43 +42,65 @@ class ArchiveAgent(BaseAgent):
     # ── Public entry point ─────────────────────────────────────────────────────
 
     async def handle(self, task: Task) -> dict:
-        historical = Path(task.input["historical_file"])
-        report     = Path(task.input["report_file"])
-        kb_dir     = Path(task.input["kb_processed_dir"])
-        run_ts     = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        historical         = Path(task.input["historical_file"])
+        open_alerts        = Path(task.input["open_alerts_file"])
+        report_file        = Path(task.input["report_file"])
+        kb_dir             = Path(task.input["kb_processed_dir"])
+        processed_alert_dir= Path(task.input["processed_alert_dir"])
+        run_ts             = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
+        # ── Validate inputs ────────────────────────────────────────────────────
         if not historical.exists():
-            raise FileNotFoundError(f"[ArchiveAgent] Missing: {historical}")
-        if not report.exists():
-            raise FileNotFoundError(f"[ArchiveAgent] Missing: {report}")
+            raise FileNotFoundError(
+                f"[ArchiveAgent] Historical file not found: {historical}\n"
+                f"  Place alerts_data.xlsx inside the 'Historical Alerts/' folder."
+            )
+        if not open_alerts.exists():
+            raise FileNotFoundError(
+                f"[ArchiveAgent] Open alerts file not found: {open_alerts}\n"
+                f"  Place open_alerts_data.xlsx inside the 'Open Alerts/' folder."
+            )
+        if not report_file.exists():
+            raise FileNotFoundError(
+                f"[ArchiveAgent] Closure report not found: {report_file}\n"
+                f"  ReportAgent must complete successfully before ArchiveAgent runs."
+            )
 
-        # Step 1 — ensure KB_Processed/ exists
+        # ── Step 1 — ensure archive directories exist ──────────────────────────
         kb_dir.mkdir(parents=True, exist_ok=True)
-        log.info("[ArchiveAgent] KB_Processed dir: %s", kb_dir)
+        processed_alert_dir.mkdir(parents=True, exist_ok=True)
 
-        # Step 2 — archive Historical Alerts/alerts_data.xlsx with timestamp
-        archived_name = f"{run_ts}_alerts_data.xlsx"
-        archived_path = kb_dir / archived_name
-        shutil.copy2(historical, archived_path)
-        log.info("[ArchiveAgent] Archived %s → %s", historical.name, archived_path)
+        # ── Step 2 — MOVE historical file → KB_Processed/<ts>_alerts_data.xlsx
+        # Move (not copy) so "Historical Alerts/" is empty after this run and
+        # ready for the next batch of historical data.
+        archived_hist_name = f"{run_ts}_alerts_data.xlsx"
+        archived_hist_path = kb_dir / archived_hist_name
+        shutil.move(str(historical), str(archived_hist_path))
+        log.info("[ArchiveAgent] Historical: moved %s → KB_Processed/%s",
+                 historical.name, archived_hist_name)
 
-        # Step 3 — merge into master_kb.xlsx
+        # ── Step 3 — merge historical snapshot into master_kb.xlsx ────────────
         master_path  = kb_dir / "master_kb.xlsx"
-        merge_result = self._merge_into_master(archived_path, master_path, run_ts)
+        merge_result = self._merge_into_master(archived_hist_path, master_path, run_ts)
 
-        # Step 4 — promote Closure Report → Historical Alerts/alerts_data.xlsx
-        # Remove the old historical file first, then move the report into its place.
-        historical.unlink()
-        shutil.move(str(report), str(historical))
-        log.info("[ArchiveAgent] Promoted  %s  →  Historical Alerts/%s",
-                 report.name, historical.name)
+        # ── Step 4 — MOVE open alerts → Processed_Alert/<ts>_open_alerts_data.xlsx
+        # Only moved after the report is confirmed to exist (validated above),
+        # so the source file is never lost if the pipeline failed earlier.
+        archived_open_name = f"{run_ts}_open_alerts_data.xlsx"
+        archived_open_path = processed_alert_dir / archived_open_name
+        shutil.move(str(open_alerts), str(archived_open_path))
+        log.info("[ArchiveAgent] Open alerts: moved %s → Processed_Alert/%s",
+                 open_alerts.name, archived_open_name)
+
+        log.info("[ArchiveAgent] Historical Alerts/ and Open Alerts/ are now empty "
+                 "— drop fresh files there for the next run.")
 
         return {
-            "archived_as":       archived_name,
-            "master_kb":         str(master_path),
-            "master_total_rows": merge_result["total_rows"],
-            "master_run_count":  merge_result["run_count"],
-            "new_alerts_data":   str(historical),
+            "archived_historical":    archived_hist_name,
+            "archived_open_alerts":   archived_open_name,
+            "master_kb":              str(master_path),
+            "master_total_rows":      merge_result["total_rows"],
+            "master_run_count":       merge_result["run_count"],
         }
 
     # ── Merge logic ────────────────────────────────────────────────────────────

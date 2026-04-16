@@ -35,7 +35,8 @@ async def main():
     print(f"    Input  (historical) : {cfg.DIR_HISTORICAL}")
     print(f"    Input  (open alerts): {cfg.DIR_OPEN_ALERTS}")
     print(f"    Output (report)     : {cfg.DIR_CLOSURE}")
-    print(f"    Archive             : {cfg.KB_PROCESSED_DIR}")
+    print(f"    Archive (historical): {cfg.KB_PROCESSED_DIR}")
+    print(f"    Archive (open)      : {cfg.DIR_PROCESSED_ALERT}")
     print()
 
     # ── Probe the LLM endpoint ────────────────────────────────────────────────
@@ -62,10 +63,11 @@ async def main():
     print(f"  ✓ Auto-Closed  : {result.output.get('auto_closed', 0)}")
     print(f"  ✗ Escalated    : {result.output.get('escalated', 0)}")
     print(f"  ? Needs Review : {result.output.get('review', 0)}")
-    print(f"  Archived as    : {result.output.get('archived_as', '—')}")
+    print(f"  Report saved   : {result.output.get('output_file', '—')}")
+    print(f"  Archived hist  : {result.output.get('archived_historical', '—')}")
+    print(f"  Archived open  : {result.output.get('archived_open_alerts', '—')}")
     print(f"  Master KB rows : {result.output.get('master_total_rows', '—')}")
     print(f"  Master KB runs : {result.output.get('master_run_count', '—')}")
-    print(f"  New training   : {result.output.get('new_alerts_data', '—')}")
     print("═" * 70 + "\n")
 
     print("Full task log:")

@@ -94,6 +94,10 @@ class A2AOrchestrator:
 
     async def run_pipeline(self):
         """Execute the four-agent pipeline sequentially."""
+        # Generate the dated output path once so every agent in this run
+        # references the same filename.
+        output_file = cfg.make_output_path()
+
         await self.send(Message("orchestrator", "EmbeddingAgent", str(uuid.uuid4()),
                                 {"file": cfg.HISTORICAL_FILE}))
 
@@ -102,12 +106,14 @@ class A2AOrchestrator:
 
         await self.send(Message("orchestrator", "ReportAgent", str(uuid.uuid4()),
                                 {"open_alerts_file": cfg.OPEN_ALERTS_FILE,
-                                 "output_file":      cfg.OUTPUT_FILE}))
+                                 "output_file":      output_file}))
 
         result = await self.send(Message("orchestrator", "ArchiveAgent", str(uuid.uuid4()),
-                                         {"historical_file":  cfg.HISTORICAL_FILE,
-                                          "report_file":      cfg.OUTPUT_FILE,
-                                          "kb_processed_dir": str(cfg.KB_PROCESSED_DIR)}))
+                                         {"historical_file":       cfg.HISTORICAL_FILE,
+                                          "open_alerts_file":      cfg.OPEN_ALERTS_FILE,
+                                          "report_file":           output_file,
+                                          "kb_processed_dir":      str(cfg.KB_PROCESSED_DIR),
+                                          "processed_alert_dir":   str(cfg.DIR_PROCESSED_ALERT)}))
         return result
 
 

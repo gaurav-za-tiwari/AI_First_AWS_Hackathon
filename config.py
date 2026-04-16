@@ -36,29 +36,44 @@ LLM_RETRIES         = 2     # retry attempts on timeout / 5xx
 # regardless of the working directory when main.py is invoked.
 #
 #  <root>/
-#  ├── Historical Alerts/          ← place alerts_data.xlsx here
-#  │     └── alerts_data.xlsx
-#  ├── Open Alerts/                ← place open_alerts_data.xlsx here
-#  │     └── open_alerts_data.xlsx
-#  ├── Closure Report/             ← auto_closure_report.xlsx written here
-#  ├── KB_Processed/               ← timestamped snapshots + master_kb.xlsx
+#  ├── Historical Alerts/          ← place alerts_data.xlsx here (one file at a time)
+#  │     └── alerts_data.xlsx          moved to KB_Processed/ after training
+#  ├── Open Alerts/                ← place open_alerts_data.xlsx here (read-only)
+#  │     └── open_alerts_data.xlsx     moved to Processed_Alert/ after report is built
+#  ├── Closure Report/             ← date-prefixed report written here
+#  │     └── YYYYMMDD_HHMMSS_auto_closure_report.xlsx
+#  ├── Processed_Alert/            ← open_alerts_data.xlsx archived here after each run
+#  │     └── YYYYMMDD_HHMMSS_open_alerts_data.xlsx
+#  ├── KB_Processed/               ← timestamped historical snapshots + master_kb.xlsx
 #  └── vector_db/                  ← ChromaDB vector store
 #
 _HERE = Path(__file__).parent.resolve()
 
-DIR_HISTORICAL   = _HERE / "Historical Alerts"
-DIR_OPEN_ALERTS  = _HERE / "Open Alerts"
-DIR_CLOSURE      = _HERE / "Closure Report"
-KB_PROCESSED_DIR = _HERE / "KB_Processed"
+DIR_HISTORICAL      = _HERE / "Historical Alerts"
+DIR_OPEN_ALERTS     = _HERE / "Open Alerts"
+DIR_CLOSURE         = _HERE / "Closure Report"
+DIR_PROCESSED_ALERT = _HERE / "Processed_Alert"
+KB_PROCESSED_DIR    = _HERE / "KB_Processed"
 
 HISTORICAL_FILE  = str(DIR_HISTORICAL  / "alerts_data.xlsx")
 OPEN_ALERTS_FILE = str(DIR_OPEN_ALERTS / "open_alerts_data.xlsx")
-OUTPUT_FILE      = str(DIR_CLOSURE     / "auto_closure_report.xlsx")
 
-# Create output directories on import so agents never have to worry about it.
-# Input directories are NOT auto-created — if they are missing, the agents
-# raise a clear FileNotFoundError so the user knows what to fix.
+# OUTPUT_FILE is generated at runtime with a date prefix so each pipeline run
+# produces a distinct, non-overwriting file, e.g.:
+#   Closure Report/20260416_143022_auto_closure_report.xlsx
+# Call make_output_path() once per pipeline run and pass the result through.
+def make_output_path() -> str:
+    """Return a date-stamped output path inside the Closure Report folder."""
+    from datetime import datetime
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return str(DIR_CLOSURE / f"{stamp}_auto_closure_report.xlsx")
+
+# Create output/archive directories on import so agents never have to worry
+# about them. Input directories (Historical Alerts, Open Alerts) are NOT
+# auto-created — a missing input dir means the files aren't there yet and
+# the agents will raise a clear FileNotFoundError.
 DIR_CLOSURE.mkdir(parents=True, exist_ok=True)
+DIR_PROCESSED_ALERT.mkdir(parents=True, exist_ok=True)
 KB_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── RAG / Vector DB ────────────────────────────────────────────────────────────

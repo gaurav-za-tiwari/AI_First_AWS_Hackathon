@@ -3,21 +3,26 @@ agent_report.py
 ===============
 Agent 3 — ReportAgent
 
-Takes the decisions produced by AnalysisAgent and:
-  1. Annotates open_alerts_data.xlsx in-place — adds Action, Closure Comment,
-     Risk Flags, and Processed At columns; updates Status to "Closed" for
-     AUTO_CLOSE decisions.
-  2. Builds a standalone auto_closure_report.xlsx with three sheets:
-       Summary        — KPI counts and per-sheet breakdown
-       Alert Decisions— full colour-coded decision table
-       Knowledge Base — closure criteria from the shared knowledge base
+Takes the decisions produced by AnalysisAgent and builds a standalone
+date-stamped report in the "Closure Report" folder:
+
+    Closure Report/<YYYYMMDD_HHMMSS>_auto_closure_report.xlsx
+
+The report contains three sheets:
+    Summary        — KPI counts and per-sheet breakdown
+    Alert Decisions— full colour-coded decision table with all open alert
+                     fields plus the model's Action, Confidence, Comment,
+                     Risk Flags, and RAG flag
+    Knowledge Base — closure criteria seeded from historical data
+
+open_alerts_data.xlsx in "Open Alerts" is NEVER modified.
 """
 
 import logging
 from datetime import datetime
 from pathlib import Path
 
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 import config as cfg
@@ -41,14 +46,16 @@ class ReportAgent(BaseAgent):
     # ── Public entry point ─────────────────────────────────────────────────────
 
     async def handle(self, task: Task) -> dict:
+        # open_alerts_file is read-only — we only read it to copy original
+        # alert fields into the report. We never write back to it.
         open_file = task.input["open_alerts_file"]
         output    = task.input["output_file"]
         decisions = self.orchestrator.knowledge_base.get("decisions", [])
         kb        = self.orchestrator.knowledge_base
 
-        log.info("[ReportAgent] Building report for %d decisions", len(decisions))
+        log.info("[ReportAgent] Building report for %d decisions → %s",
+                 len(decisions), Path(output).name)
 
-        self._annotate_source_file(open_file, decisions)
         self._build_report_workbook(output, decisions, kb)
 
         auto_closed = sum(1 for d in decisions if d["action"] == "AUTO_CLOSE")
@@ -56,65 +63,13 @@ class ReportAgent(BaseAgent):
         review      = sum(1 for d in decisions if d["action"] == "REVIEW")
 
         log.info("[ReportAgent] Saved %s — AUTO_CLOSE=%d ESCALATE=%d REVIEW=%d",
-                 output, auto_closed, escalated, review)
+                 Path(output).name, auto_closed, escalated, review)
         return {
             "output_file": output,
             "auto_closed": auto_closed,
             "escalated":   escalated,
             "review":      review,
         }
-
-    # ── Annotate open_alerts_data.xlsx in-place ────────────────────────────────
-
-    def _annotate_source_file(self, file_path: str, decisions: list[dict]):
-        if not Path(file_path).exists():
-            log.warning("[ReportAgent] %s not found — skipping annotation.", file_path)
-            return
-
-        wb           = load_workbook(file_path)
-        decision_map = {d["alert"]["alert_id"]: d for d in decisions}
-
-        for ws in wb.worksheets:
-            headers = [cell.value for cell in ws[1]]
-            if "Alert ID" not in headers:
-                continue
-
-            id_col   = headers.index("Alert ID") + 1
-            new_cols = ["Action", "Closure Comment", "Risk Flags", "Processed At"]
-            for col_name in new_cols:
-                if col_name not in headers:
-                    ws.cell(row=1, column=len(headers) + 1,
-                            value=col_name).font = Font(bold=True)
-                    headers.append(col_name)
-
-            action_col  = headers.index("Action") + 1
-            comment_col = headers.index("Closure Comment") + 1
-            flags_col   = headers.index("Risk Flags") + 1
-            ts_col      = headers.index("Processed At") + 1
-            status_col  = headers.index("Status") + 1 if "Status" in headers else None
-
-            for row_idx in range(2, ws.max_row + 1):
-                alert_id = str(ws.cell(row=row_idx, column=id_col).value or "")
-                if alert_id not in decision_map:
-                    continue
-                dec    = decision_map[alert_id]
-                action = dec.get("action", "")
-                fill   = PatternFill("solid",
-                                     start_color=self.COLOURS.get(action, "FFFFFF"))
-
-                ws.cell(row=row_idx, column=action_col,  value=action).fill = fill
-                ws.cell(row=row_idx, column=comment_col,
-                        value=dec.get("comment", "")).alignment = Alignment(wrap_text=True)
-                ws.cell(row=row_idx, column=flags_col,
-                        value=", ".join(dec.get("risk_flags", [])))
-                ws.cell(row=row_idx, column=ts_col,
-                        value=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
-
-                if status_col and action == "AUTO_CLOSE":
-                    ws.cell(row=row_idx, column=status_col, value="Closed")
-
-        wb.save(file_path)
-        log.info("[ReportAgent] Annotated %s", file_path)
 
     # ── Build standalone report workbook ───────────────────────────────────────
 
