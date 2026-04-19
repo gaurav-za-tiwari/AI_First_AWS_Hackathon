@@ -1,15 +1,21 @@
 'use strict';
+/**
+ * server/routes/views.js
+ * views.view_id is NVARCHAR(100) — allowedViews is string array from JWT.
+ * workflow_config.alert_type_id is INT (unchanged).
+ */
 const express = require('express');
 const router  = express.Router();
 const { query, buildInClause } = require('../db/connection');
 const auth = require('../middleware/auth');
 
-// GET /api/views  — only views this user can access
+// GET /api/views — only views the current user can access
 router.get('/', auth, async (req, res) => {
   try {
     const allowed = req.user.allowedViews || [];
     if (!allowed.length) return res.json([]);
 
+    // allowed is a string array — buildInClause infers NVarChar
     const { clause, params } = buildInClause('view_id', allowed, 'v');
     const rows = await query(
       `SELECT * FROM views WHERE ${clause} AND active = 1 ORDER BY view_name`,
@@ -21,7 +27,7 @@ router.get('/', auth, async (req, res) => {
   }
 });
 
-// GET /api/views/all — all views, for admin forms
+// GET /api/views/all — every view, for admin forms
 router.get('/all', auth, async (req, res) => {
   try {
     const rows = await query('SELECT * FROM views ORDER BY view_name');
@@ -32,6 +38,7 @@ router.get('/all', auth, async (req, res) => {
 });
 
 // GET /api/views/workflow/:alertTypeId
+// alert_type_id is INT — keep +req.params.alertTypeId coercion here
 router.get('/workflow/:alertTypeId', auth, async (req, res) => {
   try {
     const rows = await query(
@@ -41,7 +48,6 @@ router.get('/workflow/:alertTypeId', auth, async (req, res) => {
       { alertTypeId: +req.params.alertTypeId }
     );
 
-    // Build { "Open": ["In Review", ...], ... }
     const transitions = {};
     rows.forEach(r => {
       if (!transitions[r.source_step]) transitions[r.source_step] = [];

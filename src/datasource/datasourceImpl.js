@@ -1,12 +1,9 @@
 /**
- * datasource/datasourceImpl.js
+ * src/datasource/datasourceImpl.js
+ * Routes all datasource calls to either the mock or the live Azure SQL API.
  *
- * Runtime switch between mock and live Azure SQL (via Express API).
- *
- *   REACT_APP_DATASOURCE=mock       → all data served from in-memory mockDataSource
- *   REACT_APP_DATASOURCE=azure-sql  → calls Express/Azure SQL backend on port 4000
- *
- * Both modules export identical function signatures — no other file changes needed.
+ *   REACT_APP_DATASOURCE=mock       → mockDataSource (in-memory, no server)
+ *   REACT_APP_DATASOURCE=azure-sql  → apiDataSource  (Express → Azure SQL)
  */
 import * as mockDS from './mockDataSource';
 import * as apiDS  from './apiDataSource';

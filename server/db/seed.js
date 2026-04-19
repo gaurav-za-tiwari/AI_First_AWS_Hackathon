@@ -20,7 +20,7 @@ require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env'
 
 const { randomUUID } = require('crypto');
 const bcrypt         = require('bcryptjs');
-const { query, execute } = require('./connection');
+const { query, execute } = require('../connection');
 
 // ── Views ─────────────────────────────────────────────────────────────────────
 // view_id is NVARCHAR(100) — use readable string keys that match alerts.view_id
@@ -145,9 +145,9 @@ async function seed() {
            AND source_step   = @src
            AND target_step   = @tgt
        )
-       INSERT INTO workflow_config (alert_type_id, alert_type_name, source_step, target_step)
-       VALUES (@atid, @atname, @src, @tgt)`,
-      { atid, atname, src, tgt }
+       INSERT INTO workflow_config (id, alert_type_id, alert_type_name, source_step, target_step)
+       VALUES (@id, @atid, @atname, @src, @tgt)`,
+      { id: randomUUID(), atid, atname, src, tgt }
     );
   }
   console.log(`  ✓  ${WORKFLOW.length} workflow transitions`);
@@ -220,17 +220,17 @@ async function seed() {
     await execute(
       `IF NOT EXISTS (SELECT 1 FROM alerts WHERE Alert_ID = @aid)
        INSERT INTO alerts
-         (view_id, business_unit, Alert_ID, Customer_ID, Customer_Name,
+         (id, view_id, business_unit, Alert_ID, Customer_ID, Customer_Name,
           Alert_Type, Alert_Type_ID, Score, Status, Assigned_To,
           Created_Date, Amount, Currency, Country, Description,
           Priority, Risk_Flags)
        VALUES
-         (@vid, @bu, @aid, @cid, @cname,
+         (@id, @vid, @bu, @aid, @cid, @cname,
           @atype, @atid, @score, @status, @assigned,
           @cdate, @amount, @currency, @country, @desc,
           @priority, @flags)`,
       {
-        vid, bu, aid, cid, cname, atype, atid,
+        id: randomUUID(), vid, bu, aid, cid, cname, atype, atid,
         score, status, assigned, cdate, amount,
         currency, country, desc, priority, flags,
       }

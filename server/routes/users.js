@@ -1,22 +1,18 @@
 'use strict';
 /**
  * server/routes/users.js
- *
- * Updated to match schema changes:
- *   - users.id       → NVARCHAR(100), UUID string  (not INT IDENTITY)
- *   - users.view_id  → NVARCHAR(100) string         (not INT)
- *   - user_view_access.user_id / view_id → NVARCHAR(100) strings
- *   - allowedViews   → string array, no .map(Number)
- *   - No OUTPUT INSERTED.id — id is generated here with randomUUID()
- *   - No integer coercions (+id) anywhere
- *   - created_at / updated_at have DB defaults, never inserted/updated manually
- *     (updated_at is handled by the trg_users_updated_at trigger)
+ * All ID columns are NVARCHAR(100) strings:
+ *   - users.id, user_view_access.user_id / view_id
+ * UUIDs are generated with randomUUID() on POST.
+ * No parseInt() / +id coercions anywhere.
+ * updated_at is handled by the trg_users_updated_at trigger — not set here.
+ * created_at has a DB default — not inserted here.
  */
-const express      = require('express');
-const router       = express.Router();
-const bcrypt       = require('bcryptjs');
+const express        = require('express');
+const router         = express.Router();
+const bcrypt         = require('bcryptjs');
 const { randomUUID } = require('crypto');
-const { query, execute, buildInClause } = require('../db/connection');
+const { query, execute } = require('../db/connection');
 const auth = require('../middleware/auth');
 
 function requireAdminOrSupervisor(req, res, next) {
@@ -25,7 +21,7 @@ function requireAdminOrSupervisor(req, res, next) {
   next();
 }
 
-// ── GET /api/users ────────────────────────────────────────────────────────────
+// GET /api/users
 router.get('/', auth, requireAdminOrSupervisor, async (req, res) => {
   try {
     const users = await query(
@@ -42,7 +38,7 @@ router.get('/', auth, requireAdminOrSupervisor, async (req, res) => {
     return res.json(users.map(u => ({
       ...u,
       password_hash: undefined,
-      // view_ids are NVARCHAR — keep as strings, no parseInt
+      // view_ids are NVARCHAR strings — keep as string array
       allowedViews: u.view_ids ? u.view_ids.split(',') : [],
     })));
   } catch (err) {
@@ -50,7 +46,7 @@ router.get('/', auth, requireAdminOrSupervisor, async (req, res) => {
   }
 });
 
-// ── POST /api/users ───────────────────────────────────────────────────────────
+// POST /api/users
 router.post('/', auth, requireAdminOrSupervisor, async (req, res) => {
   try {
     const {
@@ -62,31 +58,30 @@ router.post('/', auth, requireAdminOrSupervisor, async (req, res) => {
       return res.status(400).json({ error: 'name, username, email, password, role are required' });
 
     const pwHash = await bcrypt.hash(password, 12);
-
-    // Generate UUID — id is NVARCHAR(100), not an IDENTITY column
+    // id is NVARCHAR(100) — generate UUID, not IDENTITY
     const userId = randomUUID();
 
-    // created_at and updated_at are NOT inserted — they use DB defaults
+    // created_at and updated_at are NOT inserted — they use DB defaults / trigger
     await execute(
       `INSERT INTO users
          (id, name, username, email, password_hash, role, [group], business_unit, view_id, active)
        VALUES
          (@id, @name, @username, @email, @hash, @role, @grp, @bu, @vid, @active)`,
       {
-        id:       userId,
+        id:     userId,
         name,
         username,
         email,
-        hash:     pwHash,
+        hash:   pwHash,
         role,
-        grp:      group         || null,
-        bu:       business_unit || null,
-        vid:      view_id       || null,   // NVARCHAR(100) — pass as string
-        active:   active ? 1 : 0,
+        grp:    group         || null,
+        bu:     business_unit || null,
+        vid:    view_id       || null,   // NVARCHAR(100) string
+        active: active ? 1 : 0,
       }
     );
 
-    // Insert view access rows — both user_id and view_id are NVARCHAR(100) strings
+    // user_view_access — both user_id and view_id are NVARCHAR(100)
     for (const vid of allowedViews) {
       await execute(
         `IF NOT EXISTS (
@@ -106,10 +101,9 @@ router.post('/', auth, requireAdminOrSupervisor, async (req, res) => {
   }
 });
 
-// ── GET /api/users/:id ────────────────────────────────────────────────────────
+// GET /api/users/:id
 router.get('/:id', auth, requireAdminOrSupervisor, async (req, res) => {
   try {
-    // id is NVARCHAR(100) — pass as plain string, no integer coercion
     const rows = await query(
       `SELECT u.id, u.name, u.username, u.email, u.role, u.[group],
               u.business_unit, u.view_id, u.active, u.last_login, u.created_at,
@@ -119,7 +113,7 @@ router.get('/:id', auth, requireAdminOrSupervisor, async (req, res) => {
        WHERE u.id = @id
        GROUP BY u.id, u.name, u.username, u.email, u.role, u.[group],
                 u.business_unit, u.view_id, u.active, u.last_login, u.created_at`,
-      { id: req.params.id }
+      { id: req.params.id }   // NVARCHAR string — no +req.params.id
     );
 
     if (!rows.length)
@@ -136,33 +130,35 @@ router.get('/:id', auth, requireAdminOrSupervisor, async (req, res) => {
   }
 });
 
-// ── PUT /api/users/:id ────────────────────────────────────────────────────────
+// PUT /api/users/:id
 router.put('/:id', auth, requireAdminOrSupervisor, async (req, res) => {
   try {
-    const { name, email, role, group, business_unit, view_id, active, password, allowedViews } = req.body;
+    const {
+      name, email, role, group, business_unit,
+      view_id, active, password, allowedViews,
+    } = req.body;
 
     const setClauses = [];
-    // id is NVARCHAR — pass as plain string
-    const params = { id: req.params.id };
+    const params     = { id: req.params.id };   // NVARCHAR string
 
-    if (name          !== undefined) { setClauses.push('name = @name');          params.name  = name; }
-    if (email         !== undefined) { setClauses.push('email = @email');        params.email = email; }
-    if (role          !== undefined) { setClauses.push('role = @role');          params.role  = role; }
-    if (group         !== undefined) { setClauses.push('[group] = @grp');        params.grp   = group         || null; }
-    if (business_unit !== undefined) { setClauses.push('business_unit = @bu');   params.bu    = business_unit || null; }
-    if (view_id       !== undefined) { setClauses.push('view_id = @vid');        params.vid   = view_id       || null; }
+    if (name          !== undefined) { setClauses.push('name = @name');          params.name   = name; }
+    if (email         !== undefined) { setClauses.push('email = @email');        params.email  = email; }
+    if (role          !== undefined) { setClauses.push('role = @role');          params.role   = role; }
+    if (group         !== undefined) { setClauses.push('[group] = @grp');        params.grp    = group         || null; }
+    if (business_unit !== undefined) { setClauses.push('business_unit = @bu');   params.bu     = business_unit || null; }
+    if (view_id       !== undefined) { setClauses.push('view_id = @vid');        params.vid    = view_id       || null; }
     if (active        !== undefined) { setClauses.push('active = @active');      params.active = active ? 1 : 0; }
-    if (password)                    { setClauses.push('password_hash = @hash'); params.hash  = await bcrypt.hash(password, 12); }
+    if (password)                    { setClauses.push('password_hash = @hash'); params.hash   = await bcrypt.hash(password, 12); }
 
     if (setClauses.length) {
-      // updated_at is handled by the DB trigger trg_users_updated_at — no need to set it here
+      // updated_at is managed by trg_users_updated_at trigger — do NOT set it here
       await execute(
         `UPDATE users SET ${setClauses.join(', ')} WHERE id = @id`,
         params
       );
     }
 
-    // Rebuild view access — view_id is NVARCHAR(100), keep as strings
+    // Rebuild view access — both columns are NVARCHAR(100)
     if (Array.isArray(allowedViews)) {
       await execute(
         'DELETE FROM user_view_access WHERE user_id = @id',
@@ -182,15 +178,14 @@ router.put('/:id', auth, requireAdminOrSupervisor, async (req, res) => {
   }
 });
 
-// ── PATCH /api/users/:id/toggle ───────────────────────────────────────────────
+// PATCH /api/users/:id/toggle
 router.patch('/:id/toggle', auth, requireAdminOrSupervisor, async (req, res) => {
   try {
-    // id is NVARCHAR — no integer coercion
     await execute(
       `UPDATE users
        SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END
        WHERE id = @id`,
-      { id: req.params.id }
+      { id: req.params.id }   // NVARCHAR string
     );
     return res.json({ message: 'Toggled' });
   } catch (err) {
@@ -198,10 +193,10 @@ router.patch('/:id/toggle', auth, requireAdminOrSupervisor, async (req, res) => 
   }
 });
 
-// ── DELETE /api/users/:id ─────────────────────────────────────────────────────
+// DELETE /api/users/:id
 router.delete('/:id', auth, requireAdminOrSupervisor, async (req, res) => {
   try {
-    // Both are strings — compare directly without parseInt
+    // Both are UUID strings — use string equality, not ===  with parseInt
     if (req.params.id === req.user.id)
       return res.status(400).json({ error: 'Cannot delete your own account' });
 

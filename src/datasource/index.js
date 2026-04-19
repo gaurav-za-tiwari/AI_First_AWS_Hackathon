@@ -1,13 +1,11 @@
 /**
- * datasource/index.js
+ * src/datasource/index.js
  * ─────────────────────────────────────────────────────────────────────────────
- * SINGLE CONFIG POINT — controls the entire data layer.
+ * SINGLE SWITCH POINT — controls which datasource the entire app uses.
  *
  * Set REACT_APP_DATASOURCE in .env:
  *   mock       → in-memory data, no backend needed  (default)
- *   azure-sql  → Express API → Azure SQL Server
- *
- * All other source files import from this module only.
+ *   azure-sql  → calls Express API → Azure SQL Server
  * ─────────────────────────────────────────────────────────────────────────────
  */
 export const datasourceMode = process.env.REACT_APP_DATASOURCE || 'mock';

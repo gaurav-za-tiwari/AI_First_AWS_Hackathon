@@ -1,11 +1,17 @@
 'use strict';
-const express = require('express');
-const router  = express.Router();
-const { query, execute, buildInClause, sql } = require('../db/connection');
+/**
+ * server/routes/alerts.js
+ * alerts.view_id is NVARCHAR(100) — all view_id params kept as strings.
+ * audit_log.id is NVARCHAR(100) — UUID generated per INSERT.
+ */
+const express    = require('express');
+const router     = express.Router();
+const { randomUUID } = require('crypto');
+const { query, execute, buildInClause } = require('../db/connection');
 const auth = require('../middleware/auth');
 
 const SORTABLE = new Set([
-  'Score','Status','Priority','Created_Date','Amount','Alert_ID','Customer_Name'
+  'Score','Status','Priority','Created_Date','Amount','Alert_ID','Customer_Name',
 ]);
 
 // GET /api/alerts
@@ -25,7 +31,7 @@ router.get('/', auth, async (req, res) => {
     if (!allowedViews.length)
       return res.json({ alerts: [], total: 0, page: +page, limit: +limit });
 
-    // Build IN clause for allowed views
+    // allowedViews is a string array — buildInClause handles NVarChar inference
     const { clause: inClause, params: inParams } =
       buildInClause('a.view_id', allowedViews, 'av');
 
@@ -33,12 +39,12 @@ router.get('/', auth, async (req, res) => {
     const params     = { ...inParams };
 
     if (view_id) {
+      // view_id is NVARCHAR(100) — keep as string
       conditions.push('a.view_id = @view_id');
-      // view_id is NVARCHAR(100) — pass as string, no integer coercion
       params.view_id = String(view_id);
     }
 
-    // Analysts see only their own alerts
+    // Analysts only see alerts assigned to them
     if (user.role === 'analyst') {
       conditions.push('a.Assigned_To = @assignedTo');
       params.assignedTo = user.username;
@@ -67,7 +73,7 @@ router.get('/', auth, async (req, res) => {
     const safeDir  = dir.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
     const offset   = (Number(page) - 1) * Number(limit);
 
-    // Azure SQL uses OFFSET … FETCH NEXT … ROWS ONLY  (not LIMIT … OFFSET)
+    // Azure SQL pagination: OFFSET … FETCH NEXT … ROWS ONLY
     const [alerts, totals] = await Promise.all([
       query(
         `SELECT a.*, v.view_name
@@ -121,16 +127,18 @@ router.patch('/:id/status', auth, async (req, res) => {
        SET Status          = @status,
            Action          = @action,
            Closure_Comment = @comment,
-           Processed_At    = GETUTCDATE(),
-           updated_at      = GETUTCDATE()
+           Processed_At    = GETUTCDATE()
        WHERE Alert_ID = @alertId`,
       { status, action: action || null, comment: comment || null, alertId: req.params.id }
     );
 
+    // audit_log.id is NVARCHAR(100) — generate UUID
+    // audit_log.user_id is NVARCHAR(100) — user.id is already a UUID string
     await execute(
-      `INSERT INTO audit_log (alert_id, user_id, from_status, to_status, comment, action_type)
-       VALUES (@alertId, @userId, @fromStatus, @toStatus, @comment, 'TRANSITION')`,
+      `INSERT INTO audit_log (id, alert_id, user_id, from_status, to_status, comment, action_type)
+       VALUES (@id, @alertId, @userId, @fromStatus, @toStatus, @comment, 'TRANSITION')`,
       {
+        id:         randomUUID(),
         alertId:    req.params.id,
         userId:     req.user.id,
         fromStatus: fromStatus || null,

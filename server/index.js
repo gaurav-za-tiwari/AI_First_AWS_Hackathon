@@ -12,12 +12,18 @@ const app = express();
 
 // ── Security ──────────────────────────────────────────────────────────────────
 app.use(helmet());
-app.use(cors({ origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'], credentials: true }));
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
+  credentials: true,
+}));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting
-app.use('/api/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many login attempts, please try again later' } }));
+app.use('/api/auth/login', rateLimit({
+  windowMs: 15 * 60 * 1000, max: 20,
+  message: { error: 'Too many login attempts, please try again later' },
+}));
 app.use('/api/', rateLimit({ windowMs: 60 * 1000, max: 300 }));
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -42,11 +48,9 @@ app.use((err, req, res, next) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000;
-
 app.listen(PORT, async () => {
   console.log(`\n🚀  AML Case Manager API  →  http://localhost:${PORT}`);
   console.log(`📋  Datasource: ${process.env.REACT_APP_DATASOURCE || 'mock'}\n`);
-
   if (process.env.REACT_APP_DATASOURCE === 'azure-sql') {
     await testConnection();
   } else {

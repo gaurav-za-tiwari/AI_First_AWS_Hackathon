@@ -30,8 +30,8 @@ export default function Sidebar({ activePage, onNavigate }) {
             <Shield size={19} color="#fff" />
           </div>
           <div>
-            <div style={{ fontSize:14, fontWeight:700, color:theme.color.text, letterSpacing:'-0.3px' }}>AML Manager</div>
-            <div style={{ fontSize:10, color:theme.color.textMuted, fontFamily:theme.font.mono, letterSpacing:'0.5px' }}>CASE WORKBENCH</div>
+            <div style={{ fontSize:14, fontWeight:700, color:theme.color.text, letterSpacing:'-0.3px' }}>Wipro Case Manager</div>
+            <div style={{ fontSize:10, color:theme.color.textMuted, fontFamily:theme.font.mono, letterSpacing:'0.5px' }}>Alert Workbench</div>
           </div>
         </div>
       </div>

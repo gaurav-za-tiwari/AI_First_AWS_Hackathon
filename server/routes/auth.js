@@ -1,11 +1,8 @@
 'use strict';
 /**
  * server/routes/auth.js
- *
- * Updated to match schema changes:
- *   - users.id      → NVARCHAR(100) UUID string (not INT)
- *   - view_ids      → NVARCHAR(100) strings — no .map(Number)
- *   - allowedViews  → string array in JWT payload
+ * users.id and user_view_access.view_id are NVARCHAR(100) strings — no parseInt.
+ * allowedViews in the JWT payload is a string array, e.g. ['PARTY_IB','PARTY_WMA'].
  */
 const express = require('express');
 const router  = express.Router();
@@ -21,8 +18,6 @@ router.post('/login', async (req, res) => {
     if (!username || !password)
       return res.status(400).json({ error: 'Username and password required' });
 
-    // Fetch user + allowed view IDs in one query using STRING_AGG
-    // Both users.id and user_view_access.view_id are NVARCHAR(100)
     const rows = await query(
       `SELECT u.id, u.name, u.username, u.email, u.role, u.[group],
               u.business_unit, u.view_id, u.active, u.last_login,
@@ -44,26 +39,24 @@ router.post('/login', async (req, res) => {
     if (!valid)
       return res.status(401).json({ error: 'Invalid credentials' });
 
-    // Update last_login — id is NVARCHAR(100), pass as string
+    // id is NVARCHAR(100) — pass as string
     await execute(
       'UPDATE users SET last_login = GETUTCDATE() WHERE id = @id',
       { id: user.id }
     );
 
-    // view_ids are NVARCHAR(100) strings — keep as strings, no parseInt/map(Number)
-    const allowedViews = user.view_ids
-      ? user.view_ids.split(',')
-      : [];
+    // view_ids are NVARCHAR(100) — keep as string array, no .map(Number)
+    const allowedViews = user.view_ids ? user.view_ids.split(',') : [];
 
     const payload = {
-      id:            user.id,       // UUID string e.g. "a1b2c3d4-..."
+      id:            user.id,
       username:      user.username,
       name:          user.name,
       email:         user.email,
       role:          user.role,
       group:         user.group,
       business_unit: user.business_unit,
-      allowedViews,                 // string array e.g. ["PARTY_IB", "PARTY_WMA"]
+      allowedViews,
     };
 
     const token = jwt.sign(payload, process.env.JWT_SECRET, {
